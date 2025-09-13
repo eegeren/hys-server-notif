@@ -1,183 +1,162 @@
-# monitor_multi.py
-# Gruplu izleme: "Kayıt Cihazları" (DVR/NVR/Kamera vb.) ve "Sunucular"
-# - servers.txt içindeki bölüm başlıklarıyla ( # --- Cihazlar --- / # --- Sunucular --- ) gruplar korunur
-# - Şema yoksa: "IP:port" -> tcp (Cihazlar), "IP/host" -> ping (Sunucular)
-# - İlk DOWN görüldüğünde de uyarı gönderir
-# - Başlangıçta her grubun sayısını ve izleme listesini Telegram’a yollar
-
-import os
-import sys
-import time
-import subprocess
-import socket
+# monitor_multi.py — okunabilir Telegram bildirimleri (HTML), gruplu izleme
+import os, sys, time, subprocess, socket, re
 from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
 
-# ---------- Yardımcılar ----------
-
-def base_dir_of_app() -> str:
-    """EXE veya .py çalışma klasörünü döndürür."""
+# ---------- Kurulum ----------
+def app_base():
     return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
-def load_env():
-    base = base_dir_of_app()
-    load_dotenv(os.path.join(base, ".env"))
-    return base
-
-BASE_DIR = load_env()
+BASE_DIR = app_base()
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
-COOLDOWN = int(os.getenv("ALERT_COOLDOWN_SECONDS", "600"))
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+COOLDOWN  = int(os.getenv("ALERT_COOLDOWN_SECONDS", "600"))
 RECOVERY_NOTIFY = os.getenv("RECOVERY_NOTIFY", "true").lower() == "true"
-TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "5") or "5")
+TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "5") or "5")
 
 assert BOT_TOKEN and CHAT_ID, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID zorunlu."
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-def send(msg: str):
+# ---------- Yardımcılar ----------
+def html_escape(s: str) -> str:
+    return (s.replace("&","&amp;")
+             .replace("<","&lt;")
+             .replace(">","&gt;"))
+
+def send(msg_html: str):
     try:
-        requests.post(API_URL, data={"chat_id": CHAT_ID, "text": msg})
+        requests.post(API_URL, data={"chat_id": CHAT_ID, "text": msg_html, "parse_mode": "HTML", "disable_web_page_preview": True})
     except Exception as e:
         print("Telegram gönderim hatası:", e)
 
-def is_http(target: str) -> bool:
-    t = target.strip().lower()
-    return t.startswith("http://") or t.startswith("https://")
+def is_http(t: str) -> bool: return t.lower().startswith(("http://","https://"))
+def is_tcp(t: str)  -> bool: return t.lower().startswith("tcp://")
+def is_ping(t: str) -> bool: return t.lower().startswith("ping://")
 
-def is_tcp(target: str) -> bool:
-    return target.strip().lower().startswith("tcp://")
+def normalize_target(raw: str) -> tuple[str, str]:
+    """Şema yoksa: IP:port -> tcp, IP/host -> ping"""
+    t = raw.strip()
+    tl = t.lower()
+    if tl.startswith(("http://","https://")): return t, "http"
+    if tl.startswith("tcp://"):              return t, "tcp"
+    if tl.startswith("ping://"):             return t, "ping"
+    if ":" in t:                             return f"tcp://{t}", "tcp"
+    return f"ping://{t}", "ping"
 
-def is_ping(target: str) -> bool:
-    return target.strip().lower().startswith("ping://")
+def short_reason(text: str) -> str:
+    """Uzun exception metinlerini kısa, anlaşılır nedenlere çevirir."""
+    t = str(text)
+    tl = t.lower()
 
+    # Sık karşılaşılanlar
+    if "timed out" in tl or "timeout" in tl or "read timed out" in tl:
+        return "Zaman aşımı"
+    if "connection refused" in tl or "actively refused" in tl or "winerror 10061" in tl:
+        return "Bağlantı reddedildi"
+    if "name or service not known" in tl or "getaddrinfo failed" in tl or "dns" in tl:
+        return "DNS/çözümleme hatası"
+    if "network is unreachable" in tl:
+        return "Ağ erişilemiyor"
+    if "certificate" in tl or "ssl" in tl:
+        return "SSL/sertifika hatası"
+    if "403" in tl: return "HTTP 403 (Yetkisiz)"
+    if "401" in tl: return "HTTP 401 (Kimlik doğrulama gerekiyor)"
+    if "404" in tl: return "HTTP 404 (Bulunamadı)"
+
+    # urllib3/requests uzun dizeleri kısalt
+    t = re.sub(r"HTTPConnectionPool\(.*?\)", "HTTP bağlantı hatası", t)
+    t = re.sub(r"HTTPSConnectionPool\(.*?\)", "HTTPS bağlantı hatası", t)
+    t = re.sub(r"<.*?object at 0x[0-9a-fA-F]+>", "", t)
+
+    # En fazla 140 karakter
+    t = t.strip()
+    return t[:140] + ("…" if len(t) > 140 else "")
+
+# ---------- Kontroller ----------
 def check_http(url: str) -> tuple[bool, str]:
     try:
-        # Self-signed olabilir; doğrulamayı kapatıyoruz. Güvenli ağda kullanın.
         r = requests.get(url, timeout=TIMEOUT, verify=False)
         ok = 200 <= r.status_code < 300
         return ok, f"HTTP {r.status_code}"
     except Exception as e:
-        return False, f"HTTP hata: {e}"
+        return False, short_reason(e)
 
 def check_tcp(tcp_url: str) -> tuple[bool, str]:
-    # tcp://IP:port
     u = urlparse(tcp_url)
     host = u.hostname or ""
     port = u.port or 0
     try:
         with socket.create_connection((host, port), timeout=TIMEOUT):
-            return True, f"TCP {host}:{port} OK"
+            return True, "TCP OK"
     except Exception as e:
-        return False, f"TCP hata {host}:{port} → {e}"
+        return False, short_reason(e)
 
 def check_ping(ping_url: str) -> tuple[bool, str]:
-    # ping://IP veya çıplak IP normalize edilmiş halidir
     try:
         ip = ping_url.replace("ping://", "").strip()
-        count_flag = "-n" if os.name == "nt" else "-c"
-        r = subprocess.run(["ping", count_flag, "1", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        flag = "-n" if os.name == "nt" else "-c"
+        r = subprocess.run(["ping", flag, "1", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return (r.returncode == 0), ("PING OK" if r.returncode == 0 else "PING FAIL")
     except Exception as e:
-        return False, f"PING hata: {e}"
+        return False, short_reason(e)
 
-def normalize_target(raw: str) -> tuple[str, str]:
-    """
-    Şema yoksa:
-      - 'IP:port' -> tcp
-      - 'IP/host' -> ping
-    Dönen: (normalized_target, kind)  kind ∈ {"http","tcp","ping"}
-    """
-    t = raw.strip()
-    tl = t.lower()
-    if tl.startswith(("http://", "https://")):
-        return t, "http"
-    if tl.startswith("tcp://"):
-        return t, "tcp"
-    if tl.startswith("ping://"):
-        return t, "ping"
-    if ":" in t:
-        return f"tcp://{t}", "tcp"
-    return f"ping://{t}", "ping"
-
-# ---------- servers.txt yükleme ve gruplama ----------
-
+# ---------- servers.txt ----------
 def load_servers_grouped(path: str):
-    """
-    servers.txt satırları:
-      - Bölüm başlıkları: '# --- Cihazlar ---' veya '# --- Sunucular ---'
-      - Veri: 'İSİM,HEDEF'  (HEDEF http(s)://..., tcp://IP:port, ping://IP veya çıplak IP/host)
-    Döndürür: list(dict(name, target, kind, group))
-    """
+    """Bölüm başlıkları (Cihazlar/Sunucular) korunur; yoksa otomatik: http/tcp→device, ping→server"""
     items = []
-    current_group = None  # "device" | "server" | None
+    current_group = None  # device | server | None
 
     def group_from_header(line: str):
-        line_l = line.lower()
-        if "cihaz" in line_l:     # Cihazlar
-            return "device"
-        if "sunucu" in line_l:    # Sunucular
-            return "server"
+        L = line.lower()
+        if "cihaz" in L:  return "device"
+        if "sunucu" in L: return "server"
         return None
 
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
-            if not line:
-                continue
+            if not line: continue
             if line.startswith("#"):
                 g = group_from_header(line)
-                if g:
-                    current_group = g
+                if g: current_group = g
                 continue
-            # Veri satırı
-            if "," not in line:
-                # İsim yoksa hedefi isim olarak da kabul et
-                name = line
-                target = line
-            else:
+
+            if "," in line:
                 name, target = line.split(",", 1)
+            else:
+                name, target = line, line
+
             name = name.strip()
             target = target.strip()
             norm, kind = normalize_target(target)
 
-            # Başlık yazılmadıysa otomatik gruplama:
-            # http/tcp -> device, ping -> server
-            if current_group is None:
-                grp = "device" if kind in ("http", "tcp") else "server"
-            else:
-                grp = current_group
-
+            grp = current_group if current_group else ("device" if kind in ("http","tcp") else "server")
             items.append({"name": name, "target": norm, "kind": kind, "group": grp})
     return items
-
-# ---------- Başlangıç özeti ----------
 
 def format_watchlist(items):
     dev = [i for i in items if i["group"] == "device"]
     srv = [i for i in items if i["group"] == "server"]
 
-    def _lines(group_items):
-        # "Ad (hedef)" biçiminde liste
-        out = []
-        for it in group_items:
-            out.append(f"• {it['name']}  →  {it['target']}")
-        return "\n".join(out) if out else "—"
+    def _lines(lst):
+        if not lst: return "—"
+        return "\n".join([f"• {html_escape(i['name'])}  →  <code>{html_escape(i['target'])}</code>" for i in lst])
 
-    msg = []
-    msg.append(f"📋 İzlenenler")
-    msg.append(f"   • Kayıt Cihazları: {len(dev)}")
-    msg.append(f"   • Sunucular: {len(srv)}\n")
-    msg.append("🔸 Kayıt Cihazları:\n" + _lines(dev))
-    msg.append("\n🔹 Sunucular:\n" + _lines(srv))
-    return "\n".join(msg)
+    return (
+        f"📋 <b>İzlenenler</b>\n"
+        f"• Kayıt Cihazları: <b>{len(dev)}</b>\n"
+        f"• Sunucular: <b>{len(srv)}</b>\n\n"
+        f"🔸 <u>Kayıt Cihazları</u>\n{_lines(dev)}\n\n"
+        f"🔹 <u>Sunucular</u>\n{_lines(srv)}"
+    )
 
 # ---------- Ana döngü ----------
-
 def main():
     servers_file = os.path.join(BASE_DIR, "servers.txt")
     if not os.path.exists(servers_file):
@@ -187,12 +166,13 @@ def main():
     devices = [i for i in items if i["group"] == "device"]
     servers = [i for i in items if i["group"] == "server"]
 
-    # Durum & cooldown kayıtları (isim bazlı)
     last_state = {i["name"]: None for i in items}
     last_alert = {i["name"]: 0 for i in items}
 
-    # Başlangıç mesajları
-    send(f"🔍 İzleme başlatıldı: {len(devices)} kayıt cihazı, {len(servers)} sunucu | interval={INTERVAL}s")
+    send(f"🔍 <b>İzleme başlatıldı</b>\n"
+         f"• Kayıt Cihazları: <b>{len(devices)}</b>\n"
+         f"• Sunucular: <b>{len(servers)}</b>\n"
+         f"• Aralık: <b>{INTERVAL}s</b>  |  Cooldown: <b>{COOLDOWN}s</b>")
     send(format_watchlist(items))
 
     while True:
@@ -209,23 +189,22 @@ def main():
 
             prev = last_state[name]
 
-            # İlk kez DOWN görülürse de uyar
             if not ok and prev is None:
                 if now - last_alert[name] >= COOLDOWN:
-                    send(f"❌ {name} erişilemiyor!\nDetay: {target} | {info}")
+                    send("❌ <b>{}</b> erişilemiyor!\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Neden: {}".format(
+                        html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
                     last_alert[name] = now
 
-            # UP -> DOWN
             elif not ok and prev is True:
                 if now - last_alert[name] >= COOLDOWN:
-                    send(f"❌ {name} erişilemiyor!\nDetay: {target} | {info}")
+                    send("❌ <b>{}</b> erişilemiyor!\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Neden: {}".format(
+                        html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
                     last_alert[name] = now
 
-            # DOWN -> UP
             elif ok and prev is False and RECOVERY_NOTIFY:
-                send(f"✅ {name} tekrar erişilebilir.\nDetay: {target} | {info}")
+                send("✅ <b>{}</b> tekrar erişilebilir.\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Ayrıntı: {}".format(
+                    html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
 
-            # İlk ölçümü konsola yaz (sessiz)
             if prev is None:
                 print(f"[INIT] {name} → {'UP' if ok else 'DOWN'} ({kind} | {info})")
 
