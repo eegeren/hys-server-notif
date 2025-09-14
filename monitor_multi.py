@@ -1,11 +1,12 @@
-# monitor_multi.py — okunabilir Telegram bildirimleri (HTML), gruplu izleme
-import os, sys, time, subprocess, socket, re
+# monitor_multi.py — Gruplu izleme + okunaklı alarmlar + Günlük/Haftalık raporlar
+import os, sys, time, subprocess, socket, re, json, math, random
 from urllib.parse import urlparse
+from datetime import datetime, date
 
 import requests
 from dotenv import load_dotenv
 
-# ---------- Kurulum ----------
+# ========== Kurulum / Ortam ==========
 def app_base():
     return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
@@ -19,11 +20,19 @@ COOLDOWN  = int(os.getenv("ALERT_COOLDOWN_SECONDS", "600"))
 RECOVERY_NOTIFY = os.getenv("RECOVERY_NOTIFY", "true").lower() == "true"
 TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "5") or "5")
 
+# Rapor zamanları
+DAILY_H   = int(os.getenv("DAILY_REPORT_HOUR", "9"))
+DAILY_M   = int(os.getenv("DAILY_REPORT_MINUTE", "0"))
+WEEKDAY_W = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))  # 0=Mon
+WEEKLY_H  = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
+WEEKLY_M  = int(os.getenv("WEEKLY_REPORT_MINUTE", "5"))
+
 assert BOT_TOKEN and CHAT_ID, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID zorunlu."
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+STATE_PATH = os.path.join(BASE_DIR, "state.json")  # kalıcı durum (restartlarda raporlar tutarlı olsun)
 
-# ---------- Yardımcılar ----------
+# ========== Telegram / Format ==========
 def html_escape(s: str) -> str:
     return (s.replace("&","&amp;")
              .replace("<","&lt;")
@@ -35,11 +44,12 @@ def send(msg_html: str):
     except Exception as e:
         print("Telegram gönderim hatası:", e)
 
+# ========== Tür algılama / normalize ==========
 def is_http(t: str) -> bool: return t.lower().startswith(("http://","https://"))
 def is_tcp(t: str)  -> bool: return t.lower().startswith("tcp://")
 def is_ping(t: str) -> bool: return t.lower().startswith("ping://")
 
-def normalize_target(raw: str) -> tuple[str, str]:
+def normalize_target(raw: str):
     """Şema yoksa: IP:port -> tcp, IP/host -> ping"""
     t = raw.strip()
     tl = t.lower()
@@ -49,37 +59,24 @@ def normalize_target(raw: str) -> tuple[str, str]:
     if ":" in t:                             return f"tcp://{t}", "tcp"
     return f"ping://{t}", "ping"
 
+# ========== Kısa hata sebepleri ==========
 def short_reason(text: str) -> str:
-    """Uzun exception metinlerini kısa, anlaşılır nedenlere çevirir."""
-    t = str(text)
-    tl = t.lower()
-
-    # Sık karşılaşılanlar
-    if "timed out" in tl or "timeout" in tl or "read timed out" in tl:
-        return "Zaman aşımı"
-    if "connection refused" in tl or "actively refused" in tl or "winerror 10061" in tl:
-        return "Bağlantı reddedildi"
-    if "name or service not known" in tl or "getaddrinfo failed" in tl or "dns" in tl:
-        return "DNS/çözümleme hatası"
-    if "network is unreachable" in tl:
-        return "Ağ erişilemiyor"
-    if "certificate" in tl or "ssl" in tl:
-        return "SSL/sertifika hatası"
+    t = str(text); tl = t.lower()
+    if "timed out" in tl or "timeout" in tl: return "Zaman aşımı"
+    if "connection refused" in tl or "actively refused" in tl or "winerror 10061" in tl: return "Bağlantı reddedildi"
+    if "getaddrinfo failed" in tl or "name or service not known" in tl or "dns" in tl: return "DNS/çözümleme hatası"
+    if "network is unreachable" in tl: return "Ağ erişilemiyor"
+    if "certificate" in tl or "ssl" in tl: return "SSL/sertifika hatası"
     if "403" in tl: return "HTTP 403 (Yetkisiz)"
     if "401" in tl: return "HTTP 401 (Kimlik doğrulama gerekiyor)"
     if "404" in tl: return "HTTP 404 (Bulunamadı)"
-
-    # urllib3/requests uzun dizeleri kısalt
-    t = re.sub(r"HTTPConnectionPool\(.*?\)", "HTTP bağlantı hatası", t)
-    t = re.sub(r"HTTPSConnectionPool\(.*?\)", "HTTPS bağlantı hatası", t)
+    t = re.sub(r"HTTP[S]?ConnectionPool\(.*?\)", "HTTP bağlantı hatası", t)
     t = re.sub(r"<.*?object at 0x[0-9a-fA-F]+>", "", t)
-
-    # En fazla 140 karakter
     t = t.strip()
     return t[:140] + ("…" if len(t) > 140 else "")
 
-# ---------- Kontroller ----------
-def check_http(url: str) -> tuple[bool, str]:
+# ========== Kontroller ==========
+def check_http(url: str):
     try:
         r = requests.get(url, timeout=TIMEOUT, verify=False)
         ok = 200 <= r.status_code < 300
@@ -87,7 +84,7 @@ def check_http(url: str) -> tuple[bool, str]:
     except Exception as e:
         return False, short_reason(e)
 
-def check_tcp(tcp_url: str) -> tuple[bool, str]:
+def check_tcp(tcp_url: str):
     u = urlparse(tcp_url)
     host = u.hostname or ""
     port = u.port or 0
@@ -97,7 +94,7 @@ def check_tcp(tcp_url: str) -> tuple[bool, str]:
     except Exception as e:
         return False, short_reason(e)
 
-def check_ping(ping_url: str) -> tuple[bool, str]:
+def check_ping(ping_url: str):
     try:
         ip = ping_url.replace("ping://", "").strip()
         flag = "-n" if os.name == "nt" else "-c"
@@ -106,9 +103,8 @@ def check_ping(ping_url: str) -> tuple[bool, str]:
     except Exception as e:
         return False, short_reason(e)
 
-# ---------- servers.txt ----------
+# ========== servers.txt yükleme ve gruplama ==========
 def load_servers_grouped(path: str):
-    """Bölüm başlıkları (Cihazlar/Sunucular) korunur; yoksa otomatik: http/tcp→device, ping→server"""
     items = []
     current_group = None  # device | server | None
 
@@ -156,7 +152,97 @@ def format_watchlist(items):
         f"🔹 <u>Sunucular</u>\n{_lines(srv)}"
     )
 
-# ---------- Ana döngü ----------
+# ========== Kalıcı durum (raporlar için) ==========
+def load_state():
+    if not os.path.exists(STATE_PATH):
+        return {"last_state":{}, "last_alert":{}, "stats":{}, "last_daily":"", "last_week":"", "started_at": time.time()}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_state":{}, "last_alert":{}, "stats":{}, "last_daily":"", "last_week":"", "started_at": time.time()}
+
+def save_state(state):
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print("state.json yazılamadı:", e)
+
+def ensure_stats_for(state, name):
+    if name not in state["stats"]:
+        state["stats"][name] = {"checks":0, "up":0, "down":0, "flaps":0, "last_change": None}
+
+def mark_check(state, name, ok, prev):
+    ensure_stats_for(state, name)
+    s = state["stats"][name]
+    s["checks"] += 1
+    if ok: s["up"] += 1
+    else:  s["down"] += 1
+    if prev is not None and prev != ok:
+        s["flaps"] += 1
+        s["last_change"] = time.time()
+
+def pct(a, b):
+    return 0.0 if b == 0 else round(100.0 * a / b, 1)
+
+def human_time(ts):
+    if not ts: return "—"
+    dt = datetime.fromtimestamp(ts)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+# ========== Rapor zamanlayıcı ==========
+def should_send_daily(now, state):
+    d = date.fromtimestamp(now).isoformat()
+    hh, mm = datetime.fromtimestamp(now).hour, datetime.fromtimestamp(now).minute
+    return (state.get("last_daily") != d) and (hh == DAILY_H and mm == DAILY_M)
+
+def should_send_weekly(now, state):
+    dt = datetime.fromtimestamp(now)
+    yearweek = f"{dt.isocalendar().year}-W{dt.isocalendar().week}"
+    hh, mm = dt.hour, dt.minute
+    weekday = dt.weekday()  # 0=Mon
+    return (state.get("last_week") != yearweek) and (weekday == WEEKDAY_W and hh == WEEKLY_H and mm == WEEKLY_M)
+
+def render_summary(items, state, title):
+    # Şu anki UP/DOWN
+    last_state = state.get("last_state", {})
+    up_now  = [i for i in items if last_state.get(i["name"]) is True]
+    down_now= [i for i in items if last_state.get(i["name"]) is False]
+
+    # İstatistikler
+    rows = []
+    for it in items:
+        name = it["name"]
+        st = state["stats"].get(name, {"checks":0,"up":0,"down":0,"flaps":0,"last_change":None})
+        u = pct(st["up"], st["checks"])
+        rows.append((u, st["flaps"], name, st))
+
+    # En sorunlu 5 (en düşük uptime, sonra çok flap)
+    rows.sort(key=lambda x: (x[0], -x[1]))  # düşük uptime önce
+    top5 = rows[:5]
+
+    def _list(lst):
+        if not lst: return "—"
+        return "\n".join([f"• {html_escape(i['name'])}" for i in lst])
+
+    def _top(lst):
+        if not lst: return "—"
+        out=[]
+        for u, fl, name, st in lst:
+            out.append(f"• {html_escape(name)} — <b>{u}%</b> uptime, flap:<b>{st['flaps']}</b>, son değişim:<i>{human_time(st['last_change'])}</i>")
+        return "\n".join(out)
+
+    started = human_time(state.get("started_at"))
+    return (
+        f"🧾 <b>{title}</b>\n"
+        f"Başlangıç: <i>{started}</i>\n"
+        f"Şu an: <b>{len(up_now)}</b> UP / <b>{len(down_now)}</b> DOWN\n\n"
+        f"🔻 <u>Şu an DOWN</u>\n{_list(down_now)}\n\n"
+        f"🏁 <u>En Sorunlu (TOP 5)</u>\n{_top(top5)}"
+    )
+
+# ========== Ana döngü ==========
 def main():
     servers_file = os.path.join(BASE_DIR, "servers.txt")
     if not os.path.exists(servers_file):
@@ -166,8 +252,15 @@ def main():
     devices = [i for i in items if i["group"] == "device"]
     servers = [i for i in items if i["group"] == "server"]
 
-    last_state = {i["name"]: None for i in items}
-    last_alert = {i["name"]: 0 for i in items}
+    state = load_state()
+    # ilk kayıtlar
+    for it in items:
+        ensure_stats_for(state, it["name"])
+        if it["name"] not in state["last_state"]:
+            state["last_state"][it["name"]] = None
+        if it["name"] not in state["last_alert"]:
+            state["last_alert"][it["name"]] = 0
+    save_state(state)
 
     send(f"🔍 <b>İzleme başlatıldı</b>\n"
          f"• Kayıt Cihazları: <b>{len(devices)}</b>\n"
@@ -175,11 +268,16 @@ def main():
          f"• Aralık: <b>{INTERVAL}s</b>  |  Cooldown: <b>{COOLDOWN}s</b>")
     send(format_watchlist(items))
 
+    # Döngü
     while True:
         now = time.time()
+
+        # Kontroller (hafif jitter)
         for it in items:
             name, target, kind = it["name"], it["target"], it["kind"]
+            prev = state["last_state"].get(name)
 
+            # Kontrol çalıştır
             if kind == "http":
                 ok, info = check_http(target)
             elif kind == "tcp":
@@ -187,29 +285,52 @@ def main():
             else:
                 ok, info = check_ping(target)
 
-            prev = last_state[name]
+            # İstatistik
+            mark_check(state, name, ok, prev)
+
+            # Alarm mantığı
+            last_alert_ts = state["last_alert"].get(name, 0)
 
             if not ok and prev is None:
-                if now - last_alert[name] >= COOLDOWN:
+                if now - last_alert_ts >= COOLDOWN:
                     send("❌ <b>{}</b> erişilemiyor!\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Neden: {}".format(
                         html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
-                    last_alert[name] = now
+                    state["last_alert"][name] = now
 
             elif not ok and prev is True:
-                if now - last_alert[name] >= COOLDOWN:
+                if now - last_alert_ts >= COOLDOWN:
                     send("❌ <b>{}</b> erişilemiyor!\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Neden: {}".format(
                         html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
-                    last_alert[name] = now
+                    state["last_alert"][name] = now
 
             elif ok and prev is False and RECOVERY_NOTIFY:
                 send("✅ <b>{}</b> tekrar erişilebilir.\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Ayrıntı: {}".format(
                     html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
 
+            # İlk ölçüm konsola
             if prev is None:
                 print(f"[INIT] {name} → {'UP' if ok else 'DOWN'} ({kind} | {info})")
 
-            last_state[name] = ok
+            state["last_state"][name] = ok
 
+            # Jitter
+            time.sleep(0.02 + random.uniform(0, 0.03))
+
+        # Rapor zamanları
+        now_dt = time.time()
+        if should_send_daily(now_dt, state):
+            send(render_summary(items, state, "GÜNLÜK RAPOR"))
+            state["last_daily"] = date.fromtimestamp(now_dt).isoformat()
+            save_state(state)
+
+        if should_send_weekly(now_dt, state):
+            send(render_summary(items, state, "HAFTALIK RAPOR"))
+            dt = datetime.fromtimestamp(now_dt)
+            state["last_week"] = f"{dt.isocalendar().year}-W{dt.isocalendar().week}"
+            save_state(state)
+
+        # Döngü aralığı
+        save_state(state)  # düzenli yaz
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
