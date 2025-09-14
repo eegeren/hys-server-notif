@@ -1,31 +1,33 @@
-# monitor_multi.py — Paralel kontrol + okunabilir HTML alarmlar + Gruplama + Günlük/Haftalık raporlar + Kalıcı state
+# monitor_multi.py — Paralel kontrol + Telegram timeout/proxy fix + ping kill + okunabilir alarmlar + raporlar
 import os, sys, time, subprocess, socket, re, json, random
 from urllib.parse import urlparse
 from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor
-
 import requests
 from dotenv import load_dotenv
 
-# ========== Kurulum / Ortam ==========
+# ========= Kurulum / Ortam =========
 def app_base():
     return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 
 BASE_DIR = app_base()
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
-COOLDOWN  = int(os.getenv("ALERT_COOLDOWN_SECONDS", "600"))
+BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
+INTERVAL    = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+COOLDOWN    = int(os.getenv("ALERT_COOLDOWN_SECONDS", "600"))
 RECOVERY_NOTIFY = os.getenv("RECOVERY_NOTIFY", "true").lower() == "true"
-TIMEOUT   = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "5") or "5")
-PING_MS   = int(os.getenv("PING_TIMEOUT_MS", "800"))   # Windows: ms, Linux/Mac: saniyeye çevrilir
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
+TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "5") or "5")   # HTTP/TCP check timeout
+PING_MS     = int(os.getenv("PING_TIMEOUT_MS", "800"))                # ping bekleme (ms)
+PING_KILL   = int(os.getenv("PING_KILL_AFTER_MS", "2000"))            # ping süreci en geç bu sürede sonlandırılır (ms)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))                     # paralel işçi
+TEL_TIMEOUT = float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "4"))       # Telegram istek timeout (s)
+DEBUG       = os.getenv("DEBUG", "0") == "1"                          # daha fazla log için 1 yap
 
 DAILY_H   = int(os.getenv("DAILY_REPORT_HOUR", "9"))
 DAILY_M   = int(os.getenv("DAILY_REPORT_MINUTE", "0"))
-WEEKDAY_W = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))  # 0=Mon ... 6=Sun
+WEEKDAY_W = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))   # 0=Mon ... 6=Sun
 WEEKLY_H  = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
 WEEKLY_M  = int(os.getenv("WEEKLY_REPORT_MINUTE", "5"))
 
@@ -34,22 +36,33 @@ assert BOT_TOKEN and CHAT_ID, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID zorunlu."
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 
-# ========== Telegram / Format ==========
+# Tek bir session kullan, sistem proxy'lerini devre dışı bırak
+SESSION = requests.Session()
+SESSION.trust_env = False  # env proxy'lerini kullanma (asıl donma sebebi olabiliyor)
+# İstersen proxy kullanacaksan bu satırı kaldır veya SESSION.proxies ayarla.
+
+# ========= Telegram / Format =========
 def html_escape(s: str) -> str:
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
 
 def send(msg_html: str):
     try:
-        requests.post(API_URL, data={
-            "chat_id": CHAT_ID,
-            "text": msg_html,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        })
+        SESSION.post(
+            API_URL,
+            data={
+                "chat_id": CHAT_ID,
+                "text": msg_html,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            },
+            timeout=TEL_TIMEOUT,
+            allow_redirects=False
+        )
     except Exception as e:
-        print("Telegram gönderim hatası:", e)
+        # Telegram gönderimi başarısızsa script akmaya devam etsin
+        print(f"[WARN] Telegram gönderim hatası (timeout/proxy olabilir): {e}")
 
-# ========== Tür algılama / normalize ==========
+# ========= Tür algılama / normalize =========
 def is_http(t: str) -> bool: return t.lower().startswith(("http://","https://"))
 def is_tcp(t: str)  -> bool: return t.lower().startswith("tcp://")
 def is_ping(t: str) -> bool: return t.lower().startswith("ping://")
@@ -63,7 +76,7 @@ def normalize_target(raw: str):
     if ":" in t:                             return f"tcp://{t}", "tcp"
     return f"ping://{t}", "ping"
 
-# ========== Kısa hata sebepleri ==========
+# ========= Hata nedenlerini kısalt =========
 def short_reason(text: str) -> str:
     t = str(text); tl = t.lower()
     if "timed out" in tl or "timeout" in tl: return "Zaman aşımı"
@@ -79,10 +92,10 @@ def short_reason(text: str) -> str:
     t = t.strip()
     return t[:140] + ("…" if len(t) > 140 else "")
 
-# ========== Kontroller ==========
+# ========= Kontroller =========
 def check_http(url: str):
     try:
-        r = requests.get(url, timeout=TIMEOUT, verify=False)  # self-signed olabilir
+        r = SESSION.get(url, timeout=TIMEOUT, verify=False, allow_redirects=False)
         ok = 200 <= r.status_code < 300
         return ok, f"HTTP {r.status_code}"
     except Exception as e:
@@ -97,20 +110,28 @@ def check_tcp(tcp_url: str):
         return False, short_reason(e)
 
 def check_ping(ping_url: str):
+    """Ping işlemi en fazla PING_KILL ms bekler; süre dolarsa TIMEOUT döner."""
     try:
         ip = ping_url.replace("ping://", "").strip()
         flag = "-n" if os.name == "nt" else "-c"
+
         if os.name == "nt":
             cmd = ["ping", flag, "1", "-w", str(PING_MS), ip]  # ms
         else:
-            sec = max(1, PING_MS // 1000)
-            cmd = ["ping", flag, "1", "-W", str(sec), ip]      # s
-        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return (r.returncode == 0), ("PING OK" if r.returncode == 0 else "PING FAIL")
+            wsec = max(1, PING_MS // 1000)
+            cmd = ["ping", flag, "1", "-W", str(wsec), ip]     # s
+
+        kill_sec = max(1, PING_KILL // 1000)
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=kill_sec)
+            ok = (r.returncode == 0)
+            return ok, ("PING OK" if ok else "PING FAIL")
+        except subprocess.TimeoutExpired:
+            return False, "PING TIMEOUT"
     except Exception as e:
         return False, short_reason(e)
 
-# ========== servers.txt yükleme ve gruplama ==========
+# ========= servers.txt yükleme ve gruplama =========
 def load_servers_grouped(path: str):
     items = []; current_group = None  # device | server | None
     def group_from_header(line: str):
@@ -151,7 +172,9 @@ def format_watchlist(items):
         f"🔹 <u>Sunucular</u>\n{_lines(srv)}"
     )
 
-# ========== Kalıcı durum / İstatistik ==========
+# ========= Kalıcı durum / İstatistik =========
+STATE_PATH = os.path.join(BASE_DIR, "state.json")
+
 def load_state():
     if not os.path.exists(STATE_PATH):
         return {"last_state":{}, "last_alert":{}, "stats":{}, "last_daily":"", "last_week":"", "started_at": time.time()}
@@ -182,15 +205,12 @@ def mark_check(state, name, ok, prev):
         s["flaps"] += 1
         s["last_change"] = time.time()
 
-def pct(a, b):
-    return 0.0 if b == 0 else round(100.0 * a / b, 1)
-
+def pct(a, b): return 0.0 if b == 0 else round(100.0 * a / b, 1)
 def human_time(ts):
     if not ts: return "—"
-    dt = datetime.fromtimestamp(ts)
-    return dt.strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
-# ========== Rapor zamanlayıcı ==========
+# ========= Rapor zamanlayıcı =========
 def should_send_daily(now, state):
     d = date.fromtimestamp(now).isoformat()
     dt = datetime.fromtimestamp(now)
@@ -224,18 +244,16 @@ def render_summary(items, state, title):
         out=[]
         for u, fl, name, st in lst:
             out.append(f"• {html_escape(name)} — <b>{u}%</b> uptime, flap:<b>{st['flaps']}</b>, son değişim:<i>{human_time(st['last_change'])}</i>")
-        return "\n".join(out)
-
-    started = human_time(state.get("started_at"))
+        return "\n".om
     return (
         f"🧾 <b>{title}</b>\n"
-        f"Başlangıç: <i>{started}</i>\n"
+        f"Başlangıç: <i>{human_time(state.get('started_at'))}</i>\n"
         f"Şu an: <b>{len(up_now)}</b> UP / <b>{len(down_now)}</b> DOWN\n\n"
         f"🔻 <u>Şu an DOWN</u>\n{_list(down_now)}\n\n"
         f"🏁 <u>En Sorunlu (TOP 5)</u>\n{_top(top5)}"
     )
 
-# ========== Ana döngü ==========
+# ========= Ana döngü =========
 def main():
     servers_file = os.path.join(BASE_DIR, "servers.txt")
     if not os.path.exists(servers_file):
@@ -252,16 +270,17 @@ def main():
         state["last_alert"].setdefault(it["name"], 0)
     save_state(state)
 
+    print("[INFO] Başlatılıyor… Telegram bildirimi gönderiliyor (timeout={}s)…".format(TEL_TIMEOUT))
     send(f"🔍 <b>İzleme başlatıldı</b>\n"
          f"• Kayıt Cihazları: <b>{len(devices)}</b>\n"
          f"• Sunucular: <b>{len(servers)}</b>\n"
          f"• Aralık: <b>{INTERVAL}s</b>  |  Cooldown: <b>{COOLDOWN}s</b>  |  Paralel işçi: <b>{MAX_WORKERS}</b>")
     send(format_watchlist(items))
+    print("[INFO] Başlangıç bildirimleri gönderildi. Kontroller başlıyor…")
 
     while True:
-        now = time.time()
+        loop_start = time.time()
 
-        # ---- Paralel kontrol ----
         def run_single(it):
             name, target, kind = it["name"], it["target"], it["kind"]
             prev = state["last_state"].get(name)
@@ -277,12 +296,7 @@ def main():
             last_alert_ts = state["last_alert"].get(name, 0)
             now_local = time.time()
 
-            if not ok and prev is None and (now_local - last_alert_ts) >= COOLDOWN:
-                send("❌ <b>{}</b> erişilemiyor!\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Neden: {}".format(
-                    html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
-                state["last_alert"][name] = now_local
-
-            elif not ok and prev is True and (now_local - last_alert_ts) >= COOLDOWN:
+            if not ok and (prev is None or prev is True) and (now_local - last_alert_ts) >= COOLDOWN:
                 send("❌ <b>{}</b> erişilemiyor!\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Neden: {}".format(
                     html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
                 state["last_alert"][name] = now_local
@@ -291,7 +305,7 @@ def main():
                 send("✅ <b>{}</b> tekrar erişilebilir.\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Ayrıntı: {}".format(
                     html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
 
-            if prev is None:
+            if prev is None and DEBUG:
                 print(f"[INIT] {name} → {'UP' if ok else 'DOWN'} ({kind} | {info})")
 
             state["last_state"][name] = ok
@@ -299,7 +313,7 @@ def main():
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             list(ex.map(run_single, items))
 
-        # ---- Rapor zamanları ----
+        # Rapor zamanları
         now_dt = time.time()
         if should_send_daily(now_dt, state):
             send(render_summary(items, state, "GÜNLÜK RAPOR"))
@@ -313,6 +327,8 @@ def main():
             save_state(state)
 
         save_state(state)
+        if DEBUG:
+            print(f"[DEBUG] Tur süresi: {round(time.time()-loop_start,2)} sn")
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
