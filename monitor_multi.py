@@ -241,6 +241,28 @@ def render_summary(items, state, title):
 
     def _top(lst):
         if not lst: return "—"
+        out = []
+        for u, fl, name, st in lst:
+            out.append(
+                f"• {html_escape(name)} — <b>{u}%</b> uptime, "
+                f"flap:<b>{st['flaps']}</b>, son değişim:<i>{human_time(st['last_change'])}</i>"
+            )
+        return "\n".join(out)   # <-- düzeltme
+
+    return (
+        f"🧾 <b>{title}</b>\n"
+        f"Başlangıç: <i>{human_time(state.get('started_at'))}</i>\n"
+        f"Şu an: <b>{len(up_now)}</b> UP / <b>{len(down_now)}</b> DOWN\n\n"
+        f"🔻 <u>Şu an DOWN</u>\n{_list(down_now)}\n\n"
+        f"🏁 <u>En Sorunlu (TOP 5)</u>\n{_top(top5)}"
+    )
+
+    def _list(lst):
+        if not lst: return "—"
+        return "\n".join([f"• {html_escape(i['name'])}" for i in lst])
+
+    def _top(lst):
+        if not lst: return "—"
         out=[]
         for u, fl, name, st in lst:
             out.append(f"• {html_escape(name)} — <b>{u}%</b> uptime, flap:<b>{st['flaps']}</b>, son değişim:<i>{human_time(st['last_change'])}</i>")
