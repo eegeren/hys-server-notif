@@ -1,7 +1,7 @@
 # monitor_multi.py — Paralel kontrol + Telegram timeout/proxy fix + ping kill + okunabilir alarmlar + raporlar
-import os, sys, time, subprocess, socket, re, json, random
+import os, sys, time, subprocess, socket, re, json, random, threading
 from urllib.parse import urlparse
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from dotenv import load_dotenv
@@ -31,6 +31,16 @@ WEEKDAY_W = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))   # 0=Mon ... 6=Sun
 WEEKLY_H  = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
 WEEKLY_M  = int(os.getenv("WEEKLY_REPORT_MINUTE", "5"))
 
+# Yeni ayarlar (env ile override edilebilir)
+FAILURE_THRESHOLD     = int(os.getenv("FAILURE_THRESHOLD", "3"))
+SUCCESS_THRESHOLD     = int(os.getenv("SUCCESS_THRESHOLD", "2"))
+AGG_WINDOW_SECONDS    = int(os.getenv("AGG_WINDOW_SECONDS", "60"))
+STORM_THRESHOLD       = int(os.getenv("STORM_THRESHOLD", "6"))
+STORM_SUPPRESS_SEC    = int(os.getenv("STORM_SUPPRESS_SEC", "900"))
+GLOBAL_PROBE_TARGET   = os.getenv("GLOBAL_PROBE_TARGET", "1.1.1.1")
+GLOBAL_SUPPRESS_SEC   = int(os.getenv("GLOBAL_SUPPRESS_SEC", "600"))
+MAX_ALERTS_PER_WINDOW = int(os.getenv("MAX_ALERTS_PER_WINDOW", "5"))
+
 assert BOT_TOKEN and CHAT_ID, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID zorunlu."
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -39,13 +49,12 @@ STATE_PATH = os.path.join(BASE_DIR, "state.json")
 # Tek bir session kullan, sistem proxy'lerini devre dışı bırak
 SESSION = requests.Session()
 SESSION.trust_env = False  # env proxy'lerini kullanma (asıl donma sebebi olabiliyor)
-# İstersen proxy kullanacaksan bu satırı kaldır veya SESSION.proxies ayarla.
 
 # ========= Telegram / Format =========
 def html_escape(s: str) -> str:
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
 
-def send(msg_html: str):
+def send_raw(msg_html: str):
     try:
         SESSION.post(
             API_URL,
@@ -59,8 +68,49 @@ def send(msg_html: str):
             allow_redirects=False
         )
     except Exception as e:
-        # Telegram gönderimi başarısızsa script akmaya devam etsin
         print(f"[WARN] Telegram gönderim hatası (timeout/proxy olabilir): {e}")
+
+# Basit global rate limiter + kuyruk + grouped flush
+rate_lock = threading.Lock()
+rate_window = []   # timestamps of sent messages
+rate_queue = []    # queued messages text
+def rate_evict_old():
+    cutoff = time.time() - AGG_WINDOW_SECONDS
+    with rate_lock:
+        while rate_window and rate_window[0] < cutoff:
+            rate_window.pop(0)
+
+def rate_can_send():
+    rate_evict_old()
+    with rate_lock:
+        return len(rate_window) < MAX_ALERTS_PER_WINDOW
+
+def rate_register_send():
+    with rate_lock:
+        rate_window.append(time.time())
+
+def rate_queue_push(text):
+    with rate_lock:
+        rate_queue.append(text)
+
+def rate_flush_queue_grouped():
+    with rate_lock:
+        if not rate_queue:
+            return
+        header = f"⏳ Oran sınırı nedeniyle geciken {len(rate_queue)} uyarı — tek mesajda birleştirildi:\n"
+        body = "\n".join(f"• {html_escape(l)}" for l in rate_queue)
+        # empty queue first to avoid recursion causing duplication
+        rate_queue.clear()
+    # Use send_with_rate (below) to actually send the grouped message
+    send_with_rate(header + body)
+
+def send_with_rate(text):
+    # if allowed -> send immediate; else queue
+    if rate_can_send():
+        send_raw(text)
+        rate_register_send()
+    else:
+        rate_queue_push(text)
 
 # ========= Tür algılama / normalize =========
 def is_http(t: str) -> bool: return t.lower().startswith(("http://","https://"))
@@ -177,12 +227,25 @@ STATE_PATH = os.path.join(BASE_DIR, "state.json")
 
 def load_state():
     if not os.path.exists(STATE_PATH):
-        return {"last_state":{}, "last_alert":{}, "stats":{}, "last_daily":"", "last_week":"", "started_at": time.time()}
+        return {"last_state":{}, "last_alert":{}, "stats":{}, "last_daily":"", "last_week":"", "started_at": time.time(),
+                "fail_streak": {}, "ok_streak": {}, "is_down": {}, "last_reminder": {}, "storm_until": 0, "global_suppress_until": 0, "agg_events": []}
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            st = json.load(f)
+        # ensure new keys exist for backwards-compat
+        st.setdefault("fail_streak", {})
+        st.setdefault("ok_streak", {})
+        st.setdefault("is_down", {})
+        st.setdefault("last_reminder", {})
+        st.setdefault("storm_until", 0)
+        st.setdefault("global_suppress_until", 0)
+        st.setdefault("agg_events", [])
+        return st
     except Exception:
-        return {"last_state":{}, "last_alert":{}, "stats":{}, "last_daily":"", "last_week":"", "started_at": time.time()}
+        return {"last_state":{}, "last_alert":{}, "stats":{}, "last_daily":"", "last_week":"", "started_at": time.time(),
+                "fail_streak": {}, "ok_streak": {}, "is_down": {}, "last_reminder": {}, "storm_until": 0, "global_suppress_until": 0, "agg_events": []}
+
+state_lock = threading.Lock()
 
 def save_state(state):
     try:
@@ -209,6 +272,27 @@ def pct(a, b): return 0.0 if b == 0 else round(100.0 * a / b, 1)
 def human_time(ts):
     if not ts: return "—"
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+# ========= Global probe / storm helpers =========
+def global_probe_ok():
+    # basit ping tabanlı probe (1.1.1.1 varsayılan)
+    try:
+        ok, info = check_ping("ping://" + GLOBAL_PROBE_TARGET)
+        return ok
+    except Exception:
+        return False
+
+# Aggregation event list is used to detect storm: store tuples (ts, name, 'DOWN'/'UP')
+def agg_add_event(state, name, status):
+    with state_lock:
+        state["agg_events"].append([time.time(), name, status])
+        # evict old
+        cutoff = time.time() - AGG_WINDOW_SECONDS
+        state["agg_events"] = [e for e in state["agg_events"] if e[0] >= cutoff]
+
+def agg_count_recent_downs(state):
+    cutoff = time.time() - AGG_WINDOW_SECONDS
+    return sum(1 for e in state.get("agg_events", []) if e[0] >= cutoff and e[2] == "DOWN")
 
 # ========= Rapor zamanlayıcı =========
 def should_send_daily(now, state):
@@ -247,26 +331,8 @@ def render_summary(items, state, title):
                 f"• {html_escape(name)} — <b>{u}%</b> uptime, "
                 f"flap:<b>{st['flaps']}</b>, son değişim:<i>{human_time(st['last_change'])}</i>"
             )
-        return "\n".join(out)   # <-- düzeltme
+        return "\n".join(out)
 
-    return (
-        f"🧾 <b>{title}</b>\n"
-        f"Başlangıç: <i>{human_time(state.get('started_at'))}</i>\n"
-        f"Şu an: <b>{len(up_now)}</b> UP / <b>{len(down_now)}</b> DOWN\n\n"
-        f"🔻 <u>Şu an DOWN</u>\n{_list(down_now)}\n\n"
-        f"🏁 <u>En Sorunlu (TOP 5)</u>\n{_top(top5)}"
-    )
-
-    def _list(lst):
-        if not lst: return "—"
-        return "\n".join([f"• {html_escape(i['name'])}" for i in lst])
-
-    def _top(lst):
-        if not lst: return "—"
-        out=[]
-        for u, fl, name, st in lst:
-            out.append(f"• {html_escape(name)} — <b>{u}%</b> uptime, flap:<b>{st['flaps']}</b>, son değişim:<i>{human_time(st['last_change'])}</i>")
-        return "\n".om
     return (
         f"🧾 <b>{title}</b>\n"
         f"Başlangıç: <i>{human_time(state.get('started_at'))}</i>\n"
@@ -286,64 +352,169 @@ def main():
     servers = [i for i in items if i["group"] == "server"]
 
     state = load_state()
-    for it in items:
-        ensure_stats_for(state, it["name"])
-        state["last_state"].setdefault(it["name"], None)
-        state["last_alert"].setdefault(it["name"], 0)
+    # init missing fields for each item
+    with state_lock:
+        for it in items:
+            ensure_stats_for(state, it["name"])
+            state["last_state"].setdefault(it["name"], None)
+            state["last_alert"].setdefault(it["name"], 0)
+            state["fail_streak"].setdefault(it["name"], 0)
+            state["ok_streak"].setdefault(it["name"], 0)
+            state["is_down"].setdefault(it["name"], False)
+            state["last_reminder"].setdefault(it["name"], 0)
     save_state(state)
 
     print("[INFO] Başlatılıyor… Telegram bildirimi gönderiliyor (timeout={}s)…".format(TEL_TIMEOUT))
-    send(f"🔍 <b>İzleme başlatıldı</b>\n"
+    send_with_rate(f"🔍 <b>İzleme başlatıldı</b>\n"
          f"• Kayıt Cihazları: <b>{len(devices)}</b>\n"
          f"• Sunucular: <b>{len(servers)}</b>\n"
          f"• Aralık: <b>{INTERVAL}s</b>  |  Cooldown: <b>{COOLDOWN}s</b>  |  Paralel işçi: <b>{MAX_WORKERS}</b>")
-    send(format_watchlist(items))
+    send_with_rate(format_watchlist(items))
     print("[INFO] Başlangıç bildirimleri gönderildi. Kontroller başlıyor…")
 
+    # Thread-safe run_single
+    def run_single(it):
+        name, target, kind = it["name"], it["target"], it["kind"]
+        # do probe
+        if kind == "http":
+            ok, info = check_http(target)
+        elif kind == "tcp":
+            ok, info = check_tcp(target)
+        else:
+            ok, info = check_ping(target)
+
+        with state_lock:
+            prev = state["last_state"].get(name)
+            # update stats
+            mark_check(state, name, ok, prev)
+
+            # update streaks
+            if ok:
+                state["ok_streak"][name] = state["ok_streak"].get(name, 0) + 1
+                state["fail_streak"][name] = 0
+            else:
+                state["fail_streak"][name] = state["fail_streak"].get(name, 0) + 1
+                state["ok_streak"][name] = 0
+
+            now_ts = time.time()
+            # Global suppress check (eğer global suppress aktifse bireyselleri yoksay)
+            if now_ts < state.get("global_suppress_until", 0):
+                # sadece istatistik güncelle (bireysel uyarı atma)
+                state["last_state"][name] = ok
+                return (name, ok, info, prev, None)
+
+            # storm detection pre-check: update agg events for DOWN attempts below, then count
+            # Determine transitions with debounce:
+            alert_msg = None
+            # If currently considered up (prev True or None) and fail_streak reached threshold -> declare DOWN
+            if (not state["is_down"].get(name, False)) and (state["fail_streak"][name] >= FAILURE_THRESHOLD):
+                # enforce per-target cooldown
+                last_alert = state["last_alert"].get(name, 0)
+                if (now_ts - last_alert) >= COOLDOWN:
+                    # add agg event and detect storm
+                    agg_add_event(state, name, "DOWN")
+                    recent_downs = agg_count_recent_downs(state)
+                    if recent_downs >= STORM_THRESHOLD and now_ts > state.get("storm_until", 0):
+                        # trigger storm: set storm_until and global_suppress_until
+                        state["storm_until"] = now_ts + STORM_SUPPRESS_SEC
+                        state["global_suppress_until"] = now_ts + GLOBAL_SUPPRESS_SEC
+                        alert_msg = f"🌪️ <b>ALERT FIRTINASI</b> tespit edildi — {recent_downs} hedef aynı anda düştü. Bireysel uyarılar {int(STORM_SUPPRESS_SEC/60)} dk bastırılıyor."
+                        # set last_alert for all targets so we don't spam when storm is active
+                        for it2 in items:
+                            state["last_alert"][it2["name"]] = now_ts
+                    else:
+                        # normal DOWN alert
+                        alert_msg = "❌ <b>{}</b> erişilemiyor!\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Neden: {}".format(
+                            html_escape(name), html_escape(target), kind.upper(), html_escape(info))
+                        state["last_alert"][name] = now_ts
+                        # add event already done
+                # mark is_down true regardless (so we don't keep re-declaring)
+                state["is_down"][name] = True
+                state["last_state"][name] = False
+
+            # Recovery logic: if currently down and ok_streak reached threshold -> declare UP
+            elif state["is_down"].get(name, False) and (state["ok_streak"][name] >= SUCCESS_THRESHOLD):
+                # cooldown doesn't apply for recoveries but we respect RECOVERY_NOTIFY toggle
+                agg_add_event(state, name, "UP")
+                state["is_down"][name] = False
+                state["last_state"][name] = True
+                state["last_alert"][name] = now_ts
+                if RECOVERY_NOTIFY:
+                    alert_msg = "✅ <b>{}</b> tekrar erişilebilir.\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Ayrıntı: {}".format(
+                        html_escape(name), html_escape(target), kind.upper(), html_escape(info))
+
+            else:
+                # If still down, maybe send periodic reminder
+                if state["is_down"].get(name, False):
+                    last_rem = state["last_reminder"].get(name, 0)
+                    # reminder every COOLDOWN (or set different interval)
+                    if (now_ts - last_rem) >= COOLDOWN:
+                        alert_msg = f"🔁 <b>{html_escape(name)}</b> hâlâ DOWN — {html_escape(target)}"
+                        state["last_reminder"][name] = now_ts
+                        state["last_alert"][name] = now_ts
+
+            # persist last_state if not set above
+            state["last_state"][name] = state["is_down"].get(name, False) == False
+
+        # return tuple for logging/processing in main thread if needed
+        return (name, ok, info, prev, alert_msg)
+
+    # main loop
     while True:
         loop_start = time.time()
+        # Global probe: if external probe fails, set global suppress for a while
+        try:
+            if not global_probe_ok():
+                with state_lock:
+                    if time.time() > state.get("global_suppress_until", 0):
+                        # notify once about global issue (use send_with_rate)
+                        send_with_rate("🌐 <b>Genel bağlantı sorunu</b> tespit edildi. Bireysel uyarılar {} dk bastırılacak.".format(int(GLOBAL_SUPPRESS_SEC/60)))
+                    state["global_suppress_until"] = time.time() + GLOBAL_SUPPRESS_SEC
+        except Exception:
+            # ignore probe errors
+            pass
 
-        def run_single(it):
-            name, target, kind = it["name"], it["target"], it["kind"]
-            prev = state["last_state"].get(name)
-
-            if kind == "http":
-                ok, info = check_http(target)
-            elif kind == "tcp":
-                ok, info = check_tcp(target)
-            else:
-                ok, info = check_ping(target)
-
-            mark_check(state, name, ok, prev)
-            last_alert_ts = state["last_alert"].get(name, 0)
-            now_local = time.time()
-
-            if not ok and (prev is None or prev is True) and (now_local - last_alert_ts) >= COOLDOWN:
-                send("❌ <b>{}</b> erişilemiyor!\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Neden: {}".format(
-                    html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
-                state["last_alert"][name] = now_local
-
-            elif ok and prev is False and RECOVERY_NOTIFY:
-                send("✅ <b>{}</b> tekrar erişilebilir.\n• Hedef: <code>{}</code>\n• Tür: <b>{}</b>\n• Ayrıntı: {}".format(
-                    html_escape(name), html_escape(target), kind.upper(), html_escape(info)))
-
-            if prev is None and DEBUG:
-                print(f"[INIT] {name} → {'UP' if ok else 'DOWN'} ({kind} | {info})")
-
-            state["last_state"][name] = ok
-
+        # run checks in parallel
+        results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            list(ex.map(run_single, items))
+            for res in ex.map(run_single, items):
+                if res:
+                    results.append(res)
+
+        # Collect alert messages (thread-safe returns)
+        alert_lines = []
+        for tup in results:
+            name, ok, info, prev, alert_msg = tup
+            if alert_msg:
+                # if global suppress active (set after run_single maybe), skip sending individual
+                if time.time() < state.get("global_suppress_until", 0):
+                    # queue a short info for grouping later
+                    agg_add_event(state, name, "SUPPRESSED")
+                    continue
+                alert_lines.append(alert_msg if isinstance(alert_msg, str) else str(alert_msg))
+
+        # If many alerts at once, group them
+        if alert_lines:
+            # group into one message if too many
+            if len(alert_lines) == 1:
+                send_with_rate(alert_lines[0])
+            else:
+                text = "📣 <b>Durum değişiklikleri ({} adet)</b>\n".format(len(alert_lines))
+                text += "\n".join(f"• {line}" for line in alert_lines)
+                send_with_rate(text)
+
+        # flush queued rate messages if any
+        rate_flush_queue_grouped()
 
         # Rapor zamanları
         now_dt = time.time()
         if should_send_daily(now_dt, state):
-            send(render_summary(items, state, "GÜNLÜK RAPOR"))
+            send_with_rate(render_summary(items, state, "GÜNLÜK RAPOR"))
             state["last_daily"] = date.fromtimestamp(now_dt).isoformat()
             save_state(state)
 
         if should_send_weekly(now_dt, state):
-            send(render_summary(items, state, "HAFTALIK RAPOR"))
+            send_with_rate(render_summary(items, state, "HAFTALIK RAPOR"))
             dt = datetime.fromtimestamp(now_dt)
             state["last_week"] = f"{dt.isocalendar().year}-W{dt.isocalendar().week}"
             save_state(state)
