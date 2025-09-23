@@ -18,20 +18,20 @@ CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
 INTERVAL    = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 COOLDOWN    = int(os.getenv("ALERT_COOLDOWN_SECONDS", "600"))
 RECOVERY_NOTIFY = os.getenv("RECOVERY_NOTIFY", "true").lower() == "true"
-TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "5") or "5")   # HTTP/TCP check timeout
-PING_MS     = int(os.getenv("PING_TIMEOUT_MS", "800"))                # ping bekleme (ms)
-PING_KILL   = int(os.getenv("PING_KILL_AFTER_MS", "2000"))            # ping süreci en geç bu sürede sonlandırılır (ms)
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))                     # paralel işçi
-TEL_TIMEOUT = float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "4"))       # Telegram istek timeout (s)
-DEBUG       = os.getenv("DEBUG", "0") == "1"                          # daha fazla log için 1 yap
+TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "5") or "5")    
+PING_MS     = int(os.getenv("PING_TIMEOUT_MS", "800"))                 
+PING_KILL   = int(os.getenv("PING_KILL_AFTER_MS", "2000"))             
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))                      
+TEL_TIMEOUT = float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "4"))        
+DEBUG       = os.getenv("DEBUG", "0") == "1"                           
 
 DAILY_H   = int(os.getenv("DAILY_REPORT_HOUR", "9"))
 DAILY_M   = int(os.getenv("DAILY_REPORT_MINUTE", "0"))
-WEEKDAY_W = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))   # 0=Mon ... 6=Sun
+WEEKDAY_W = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))    
 WEEKLY_H  = int(os.getenv("WEEKLY_REPORT_HOUR", "9"))
 WEEKLY_M  = int(os.getenv("WEEKLY_REPORT_MINUTE", "5"))
 
-# Yeni ayarlar (env ile override edilebilir)
+
 FAILURE_THRESHOLD     = int(os.getenv("FAILURE_THRESHOLD", "3"))
 SUCCESS_THRESHOLD     = int(os.getenv("SUCCESS_THRESHOLD", "2"))
 AGG_WINDOW_SECONDS    = int(os.getenv("AGG_WINDOW_SECONDS", "60"))
@@ -183,7 +183,7 @@ def check_ping(ping_url: str):
 
 # ========= servers.txt yükleme ve gruplama =========
 def load_servers_grouped(path: str):
-    items = []; current_group = None  # device | server | None
+    items = []; current_group = None   
     def group_from_header(line: str):
         L = line.lower()
         if "cihaz" in L:  return "device"
@@ -232,7 +232,7 @@ def load_state():
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             st = json.load(f)
-        # ensure new keys exist for backwards-compat
+
         st.setdefault("fail_streak", {})
         st.setdefault("ok_streak", {})
         st.setdefault("is_down", {})
@@ -275,7 +275,6 @@ def human_time(ts):
 
 # ========= Global probe / storm helpers =========
 def global_probe_ok():
-    # basit ping tabanlı probe (1.1.1.1 varsayılan)
     try:
         ok, info = check_ping("ping://" + GLOBAL_PROBE_TARGET)
         return ok
@@ -316,7 +315,7 @@ def render_summary(items, state, title):
         st = state["stats"].get(name, {"checks":0,"up":0,"down":0,"flaps":0,"last_change":None})
         u = pct(st["up"], st["checks"])
         rows.append((u, st["flaps"], name, st))
-    rows.sort(key=lambda x: (x[0], -x[1]))  # en düşük uptime önce
+    rows.sort(key=lambda x: (x[0], -x[1]))  
     top5 = rows[:5]
 
     def _list(lst):
@@ -352,7 +351,6 @@ def main():
     servers = [i for i in items if i["group"] == "server"]
 
     state = load_state()
-    # init missing fields for each item
     with state_lock:
         for it in items:
             ensure_stats_for(state, it["name"])
@@ -428,13 +426,12 @@ def main():
                             html_escape(name), html_escape(target), kind.upper(), html_escape(info))
                         state["last_alert"][name] = now_ts
                         # add event already done
-                # mark is_down true regardless (so we don't keep re-declaring)
+
                 state["is_down"][name] = True
                 state["last_state"][name] = False
 
-            # Recovery logic: if currently down and ok_streak reached threshold -> declare UP
             elif state["is_down"].get(name, False) and (state["ok_streak"][name] >= SUCCESS_THRESHOLD):
-                # cooldown doesn't apply for recoveries but we respect RECOVERY_NOTIFY toggle
+
                 agg_add_event(state, name, "UP")
                 state["is_down"][name] = False
                 state["last_state"][name] = True
