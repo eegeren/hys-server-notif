@@ -47,3 +47,8 @@ B2c server,ping://10.255.243.85
 Wehomy server,ping://10.255.243.22
 Wehomy sql,ping://10.255.243.22
 Wehomy services,ping://10.255.243.23
+
+# === TEST SUNUCULARI ===
+Test HTTP, http://example.com
+Test TCP, 127.0.0.1:22
+Test PING, 8.8.8.8
