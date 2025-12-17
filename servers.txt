@@ -1,0 +1,50 @@
+# --- Cihazlar (TCP/HTTP) ---
+Genel Merkez Dvr1,tcp://192.168.6.184:34660
+Genel Merkez Dvr2,tcp://192.168.6.11:34689
+Genel Merkez Dvr3,tcp://192.168.6.185:34536
+Genel Merkez Dvr4,tcp://192.168.6.186:34616
+Genel Merkez Dvr5,tcp://192.168.6.187:34626
+Bandirma Koroglu Dvr,tcp://192.168.12.78:34678
+Biga Hys Dvr,tcp://192.168.22.79:34665
+Erdek Koroglu Dvr,tcp://192.168.23.79:34663
+Canakkale Koroglu Dvr,tcp://192.168.9.218:34596
+Canakkale Hys Dvr,tcp://192.168.10.79:34561
+Balikesir Hys Dvr,tcp://192.168.11.79:34667
+Newstyle Dvr1,tcp://192.168.8.218:34668
+Newstyle Dvr2,tcp://192.168.8.219:34666
+Can Hys Dvr,tcp://192.168.14.79:34675
+Balikesir Koroglu Dvr,tcp://192.168.17.218:34676
+Balikesir Koroglu Dvr2,tcp://192.168.17.219:34575
+Bursa Heykel Dvr,tcp://192.168.16.79:34769
+Kemalpasa Hys Dvr,tcp://192.168.19.79:45778
+Karacabey Hys Dvr,tcp://192.168.21.160:34691
+Bandirma Koroglu arkadepo Dvr,tcp://192.168.12.80:34598
+Kemalpasa Newstyle Dvr,tcp://192.168.25.98:34595
+Inegol Hys Dvr,tcp://192.168.26.7:34678
+Gonen Hys Dvr,tcp://192.168.3.79:45679
+Canakkale Outlet ipdvr,http://192.168.55.49/
+Wehomy Sunta ipdvr,http://192.168.28.10/
+Wegarden ipdvr,tcp://192.168.27.94:34558
+Inegol Koltuk dvr,tcp://192.168.15.105:34690
+Bandirma Mobilya Dvr,tcp://192.168.13.1:34567
+Bursa Heyza Dvr,http://192.168.29.201/
+Bursa Heyza 2Dvr,http://192.168.29.200/
+Hys Merkez Onbahce Dvr,tcp://192.168.4.201:37777
+Balikesir Mobilya Dvr,http://192.168.18.15/
+
+# --- Sunucular (PING) ---
+Merkezterm,ping://10.255.243.50
+Şubeterm,ping://10.255.243.51
+Sql server,ping://10.255.243.10
+Rapor server,ping://10.255.243.12
+Msg server,ping://10.255.243.15
+Media server,ping://10.255.243.11
+IIs server,ping://10.255.243.25
+Master DC,ping://192.168.6.1
+Hysadc,ping://10.255.243.5
+Enibra server,ping://10.255.243.20
+B2c server,ping://10.255.243.85
+Wehomy server,ping://10.255.243.22
+Wehomy sql,ping://10.255.243.22
+Wehomy services,ping://10.255.243.23
+
